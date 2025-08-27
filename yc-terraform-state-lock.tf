@@ -1,102 +1,52 @@
-terraform {
-  required_providers {
-    yandex = {
-      source = "yandex-cloud/yandex"
-      version = ">= 0.100"
-    }
-    aws = {
-      source  = "hashicorp/aws"
-      version = "= 5.44"
-    }
-  }
-}
-provider "aws" {
-  region                      = "eu-west-1"
-  skip_credentials_validation = true
-  skip_requesting_account_id  = true
-  skip_metadata_api_check     = true
-  access_key                  = yandex_iam_service_account_static_access_key.sa-static-key.access_key
-  secret_key                  = yandex_iam_service_account_static_access_key.sa-static-key.secret_key
-  endpoints {
-    dynamodb = yandex_ydb_database_serverless.database.document_api_endpoint
-  }
+locals {
+  name = var.name != null ? var.name : "terraform-bucket-${random_string.bucket_name.result}"
 }
 
-variable "name" {
-  description = "Unique Name of the Bucket"
-  type        = string
+resource "random_string" "bucket_name" {
+  length  = 8
+  special = false
+  upper   = false
 }
 
 data "yandex_client_config" "client" {}
 
-# Создание сервисного аккаунта
-resource "yandex_iam_service_account" "sa" {
-  name        = "${var.name}-sa"
-  description = "Service account for Terraform state"
-}
+module "s3" {
+  source = "github.com/terraform-yc-modules/terraform-yc-s3.git?ref=9fc2f832875aefb6051a2aa47b5ecc9a7ea8fde5" # Commit hash for 1.0.2
 
-# Назначение роли сервисному аккаунту - storage
-resource "yandex_resourcemanager_folder_iam_member" "sa-admin-s3" {
   folder_id = data.yandex_client_config.client.folder_id
-  role      = "storage.admin"
-  member    = "serviceAccount:${yandex_iam_service_account.sa.id}"
-}
-
-# Назначение роли сервисному аккаунту - kms
-resource "yandex_resourcemanager_folder_iam_member" "sa-editor-kms" {
-  folder_id = data.yandex_client_config.client.folder_id
-  role      = "kms.editor"
-  member    = "serviceAccount:${yandex_iam_service_account.sa.id}"
+  bucket_name = local.name
+  sse_kms_key_configuration = {
+    name            = "${local.name}-kms"
+    description     = "Key for bucket ${local.name}"
+    rotation_period = "8760h" # 1год
+  }
+  server_side_encryption_configuration = {
+    enabled = true
+    sse_algorithm = "aws:kms"
+  }
+  versioning = {
+    enabled = true
+  }
+  lifecycle_rule = [ 
+    {
+      enabled = true
+      noncurrent_version_expiration = {
+        days = 30
+      }
+    }
+  ]
 }
 
 # Назначение роли сервисному аккаунту - ydb
 resource "yandex_resourcemanager_folder_iam_member" "sa-editor-ydb" {
   folder_id = data.yandex_client_config.client.folder_id
   role      = "ydb.editor"
-  member    = "serviceAccount:${yandex_iam_service_account.sa.id}"
-}
-
-# Создание статического ключа доступа
-resource "yandex_iam_service_account_static_access_key" "sa-static-key" {
-  service_account_id = yandex_iam_service_account.sa.id
-  description        = "Static access key for bucket ${var.name} and YDB"
-}
-
-# Создание симметричного ключа шифрования
-resource "yandex_kms_symmetric_key" "key" {
-  name            = "${var.name}-kms"
-  description     = "Key for bucket ${var.name}"
-  rotation_period = "8760h" # 1год
-}
-
-# Создание бакета
-resource "yandex_storage_bucket" "state" {
-  bucket     = var.name #${random_string.unique_id.result}
-  access_key = yandex_iam_service_account_static_access_key.sa-static-key.access_key
-  secret_key = yandex_iam_service_account_static_access_key.sa-static-key.secret_key
-  server_side_encryption_configuration {
-    rule {
-      apply_server_side_encryption_by_default {
-        kms_master_key_id = yandex_kms_symmetric_key.key.id
-        sse_algorithm     = "aws:kms"
-      }
-    }
-  }
-  versioning {
-    enabled = true
-  }
-  lifecycle_rule {
-    enabled = true
-    noncurrent_version_expiration {
-      days = 30
-    }
-  }
-  depends_on = [ yandex_resourcemanager_folder_iam_member.sa-admin-s3 ]
+  member    = "serviceAccount:${module.s3.storage_admin_service_account_id}"
 }
 
 # Создание YDB-базы для блокировки state-файла
 resource "yandex_ydb_database_serverless" "database" {
-  name        = "${var.name}-ydb"
+  name        = "${local.name}-ydb"
   location_id = "ru-central1"
 }
 
@@ -115,14 +65,14 @@ resource "aws_dynamodb_table" "lock_table" {
     name = "LockID"
     type = "S"
   }
-  depends_on   = [time_sleep.wait_for_database, yandex_resourcemanager_folder_iam_member.sa-editor-ydb, yandex_iam_service_account_static_access_key.sa-static-key]
+  depends_on   = [time_sleep.wait_for_database, yandex_resourcemanager_folder_iam_member.sa-editor-ydb, module.s3]
 }
 
 # Создание файла .env с ключами доступа
 resource "local_file" "env" {
   content = <<EOH
-    export AWS_ACCESS_KEY_ID="${yandex_iam_service_account_static_access_key.sa-static-key.access_key}"
-    export AWS_SECRET_ACCESS_KEY="${yandex_iam_service_account_static_access_key.sa-static-key.secret_key}"
+    export AWS_ACCESS_KEY_ID="${module.s3.storage_admin_access_key}"
+    export AWS_SECRET_ACCESS_KEY="${module.s3.storage_admin_secret_key}"
   EOH
   filename = ".env"
 }
@@ -133,7 +83,7 @@ output "backend_tf" {
 terraform {
   backend "s3" {
     region         = "ru-central1"
-    bucket         = "${yandex_storage_bucket.state.id}"
+    bucket         = "${module.s3.bucket_name}"
     key            = "terraform.tfstate"
 
     dynamodb_table = "${aws_dynamodb_table.lock_table.id}"

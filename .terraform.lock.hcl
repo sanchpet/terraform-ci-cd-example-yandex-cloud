@@ -16,6 +16,14 @@ provider "registry.terraform.io/hashicorp/local" {
   ]
 }
 
+provider "registry.terraform.io/hashicorp/random" {
+  version     = "3.7.2"
+  constraints = "> 3.5.0"
+  hashes = [
+    "h1:KG4NuIBl1mRWU0KD/BGfCi1YN/j3F7H4YgeeM7iSdNs=",
+  ]
+}
+
 provider "registry.terraform.io/hashicorp/time" {
   version = "0.13.1"
   hashes = [
